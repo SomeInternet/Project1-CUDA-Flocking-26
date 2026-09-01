@@ -1,4 +1,7 @@
 #pragma once
+//Extra credit
+#define GRID_LOOPING_OPT 1
+#define SHARED_MEMORY_OPT 0
 
 namespace Boids {
     void initSimulation(int N);

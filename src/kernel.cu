@@ -20,6 +20,10 @@
 #include <thrust/tuple.h>
 #include <thrust/iterator/zip_iterator.h>
 #endif
+#if !ZIP_ITERATOR
+#include <thrust/gather.h>
+#endif
+#define MANUAL_GATHER 1
 
 #include <glm/glm.hpp>
 
@@ -523,13 +527,28 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
   //   the boids rules, if this boid is within the neighborhood distance.
   // - Clamp the speed change before putting the new speed in vel2
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    glm::vec3 posSelf;
+    if (idx < N) {
+        posSelf = pos[idx];
+    }
+
+#if SHARED_MEMORY_OPT
+    __shared__ glm::vec3 sPos[blockSize];
+    __shared__ glm::vec3 sVel1[blockSize];
+
+    if (idx < N) {
+        sPos[threadIdx.x] = posSelf;
+        sVel1[threadIdx.x] = vel1[idx];
+    }
+    __syncthreads();
+#endif
+
     if (idx >= N) return;
 
     glm::vec3 gridCell = (pos[idx] - gridMin) * inverseCellWidth;
-    glm::ivec3 hi = glm::round(gridCell);
-    glm::ivec3 lo = hi - glm::ivec3(1);
-
-    glm::vec3 posSelf = pos[idx];
+    glm::ivec3 hi = glm::min(glm::ivec3(gridResolution - 1), glm::ivec3(glm::round(gridCell)));
+    glm::ivec3 lo = glm::max(glm::ivec3(0), hi - glm::ivec3(1));
 
     float numNeighbors1{ 0.f };
     float numNeighbors3{ 0.f };
@@ -538,30 +557,160 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
     glm::vec3 r2Dir{ 0.f };
     glm::vec3 r3Vel{ 0.f };
 
-    for (int k = glm::max(lo.z, 0); k <= glm::min(hi.z, gridResolution - 1); ++k) {
-        for (int j = glm::max(lo.y, 0); j <= glm::min(hi.y, gridResolution - 1); ++j) {
-            for (int i = glm::max(lo.x, 0); i <= glm::min(hi.x, gridResolution - 1); ++i) {
+    for (int k = lo.z; k <= hi.z; ++k) {
+        for (int j = lo.y; j <= hi.y; ++j) {
+            for (int i = lo.x; i <= hi.x; ++i) {
 
                 //Loop over vertices in this grid cell
                 for (int pIdx = gridCellStartIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; pIdx <= gridCellEndIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; ++pIdx) {
                     if (pIdx == -1) break;
 
                     if (pIdx != idx) {
-                        float dist = glm::length(pos[pIdx] - posSelf);
+#if SHARED_MEMORY_OPT
+                        //Check if it's in the shared memory cache (the thread responsible for this other boid is in this block)
+                        glm::vec3 pPos = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+                            sPos[pIdx - blockIdx.x * blockDim.x] : pos[pIdx];
+                        glm::vec3 pVel = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+                            sVel1[pIdx - blockIdx.x * blockDim.x] : vel1[pIdx];
+#endif
+#if !SHARED_MEMORY_OPT
+                        glm::vec3 pPos = pos[pIdx];
+                        glm::vec3 pVel = vel1[pIdx];
+#endif
+
+                        float dist = glm::length(pPos - posSelf);
+
                         //Rule1
                         if (dist < rule1Distance) {
-                            r1PerceivedCenter += pos[pIdx];
+                            r1PerceivedCenter += pPos;
                             ++numNeighbors1;
                         }
 
                         //Rule2
                         if (dist < rule2Distance) {
-                            r2Dir -= pos[pIdx] - posSelf;
+                            r2Dir -= pPos - posSelf;
                         }
 
                         //Rule3
                         if (dist < rule3Distance) {
-                            r3Vel += vel1[pIdx];
+                            r3Vel += pVel;
+                            ++numNeighbors3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    //Prevent shenanigans if 0 neighbors
+    numNeighbors1 = (numNeighbors1) ? numNeighbors1 : 1.f;
+    numNeighbors3 = (numNeighbors3) ? numNeighbors3 : 1.f;
+
+    r1PerceivedCenter = (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale;
+    r2Dir *= rule2Scale;
+    r3Vel *= rule3Scale / numNeighbors3;
+
+    glm::vec3 newVel = vel1[idx] + r1PerceivedCenter + r2Dir + r3Vel;
+    newVel = (glm::length(newVel) > maxSpeed) ? glm::normalize(newVel) * maxSpeed : newVel;
+    vel2[idx] = newVel;
+}
+
+//Extra credit
+__global__ void kernUpdateVelNeighborSearchCoherentGridLoopOptimization(
+    int N, int gridResolution, glm::vec3 gridMin,
+    float inverseCellWidth, float cellWidth,
+    int *gridCellStartIndices, int *gridCellEndIndices,
+    glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 *vel2) {
+    // TODO-2.3 - This should be very similar to kernUpdateVelNeighborSearchScattered,
+    // except with one less level of indirection.
+    // This should expect gridCellStartIndices and gridCellEndIndices to refer
+    // directly to pos and vel1.
+    // - Identify the grid cell that this particle is in
+    // - Identify which cells may contain neighbors. This isn't always 8.
+    // - For each cell, read the start/end indices in the boid pointer array.
+    //   DIFFERENCE: For best results, consider what order the cells should be
+    //   checked in to maximize the memory benefits of reordering the boids data.
+    // - Access each boid in the cell and compute velocity change from
+    //   the boids rules, if this boid is within the neighborhood distance.
+    // - Clamp the speed change before putting the new speed in vel2
+
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    glm::vec3 posSelf;
+    if (idx < N) {
+        posSelf = pos[idx];
+    }
+
+#if SHARED_MEMORY_OPT
+    __shared__ glm::vec3 sPos[blockSize];
+    __shared__ glm::vec3 sVel1[blockSize];
+
+    if (idx < N) {
+        sPos[threadIdx.x] = posSelf;
+        sVel1[threadIdx.x] = vel1[idx];
+    }
+    __syncthreads();
+#endif
+
+    if (idx >= N) return;
+
+    float maxRuleDistance = glm::max(rule1Distance, glm::max(rule2Distance, rule3Distance));
+
+    glm::vec3 gridCell = (pos[idx] - gridMin) * inverseCellWidth;
+
+    //Compute the bounds of the bounding box containing all possible reachable grid cells
+    glm::ivec3 lo = glm::floor(glm::max(glm::vec3(0), gridCell - maxRuleDistance / cellWidth));
+    glm::ivec3 hi = glm::floor(glm::min(glm::vec3(gridResolution - 1), gridCell + maxRuleDistance / cellWidth));
+
+    float numNeighbors1{ 0.f };
+    float numNeighbors3{ 0.f };
+
+    glm::vec3 r1PerceivedCenter{ 0.f };
+    glm::vec3 r2Dir{ 0.f };
+    glm::vec3 r3Vel{ 0.f };
+
+    for (int k = lo.z; k <= hi.z; ++k) {
+        for (int j = lo.y; j <= hi.y; ++j) {
+            for (int i = lo.x; i <= hi.x; ++i) {
+                //Check if this cell is reachable
+                glm::vec3 cellMin = cellWidth * glm::vec3(i, j, k) + gridMin;
+                glm::vec3 cellMax = cellWidth * glm::vec3(i + 1, j + 1, k + 1) + gridMin;
+                glm::vec3 closest = glm::clamp(posSelf, cellMin, cellMax);
+                if (glm::length(closest - posSelf) > maxRuleDistance) continue;
+
+                //Loop over vertices in this grid cell
+                for (int pIdx = gridCellStartIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; pIdx <= gridCellEndIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; ++pIdx) {
+                    if (pIdx == -1) break;
+
+                    if (pIdx != idx) {
+#if SHARED_MEMORY_OPT
+                        //Check if it's in the shared memory cache (the thread responsible for this other boid is in this block)
+                        glm::vec3 pPos = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+                            sPos[pIdx - blockIdx.x * blockDim.x] : pos[pIdx];
+                        glm::vec3 pVel = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+                            sVel1[pIdx - blockIdx.x * blockDim.x] : vel1[pIdx];
+#endif
+#if !SHARED_MEMORY_OPT
+                        glm::vec3 pPos = pos[pIdx];
+                        glm::vec3 pVel = vel1[pIdx];
+#endif
+
+                        float dist = glm::length(pPos - posSelf);
+                        
+                        //Rule1
+                        if (dist < rule1Distance) {
+                            r1PerceivedCenter += pPos;
+                            ++numNeighbors1;
+                        }
+
+                        //Rule2
+                        if (dist < rule2Distance) {
+                            r2Dir -= pPos - posSelf;
+                        }
+
+                        //Rule3
+                        if (dist < rule3Distance) {
+                            r3Vel += pVel;
                             ++numNeighbors3;
                         }
                     }
@@ -649,7 +798,7 @@ __global__ void kernShuffle(int N, int *particleArrayIndices, glm::vec3 *posTo, 
     int fromIdx = particleArrayIndices[idx];
     
     posTo[idx] = posFrom[fromIdx];
-    velTo[idx] = posFrom[fromIdx];
+    velTo[idx] = velFrom[fromIdx];
 }
 
 void Boids::stepSimulationCoherentGrid(float dt) {
@@ -689,7 +838,17 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     thrust::device_ptr<int> dev_thrust_values(dev_particleArrayIndices);
     thrust::sort_by_key(dev_thrust_keys, dev_thrust_keys + numObjects, dev_thrust_values);
 
-    kernShuffle << <blocks, threadsPerBlock >> > (numObjects, dev_particleArrayIndices, dev_pos2, dev_pos, dev_vel2, dev_vel1);
+#if !MANUAL_GATHER
+    thrust::device_ptr<int> dev_thrustGatherKeys(dev_particleArrayIndices);
+    thrust::device_ptr<glm::vec3> dev_thrustGatherPosDest(dev_pos2);
+    thrust::device_ptr<glm::vec3> dev_thrustGatherVelDest(dev_vel2);
+
+    thrust::gather(dev_thrustGatherKeys, dev_thrustGatherKeys + numObjects, dev_thrust_pos, dev_thrustGatherPosDest);
+    thrust::gather(dev_thrustGatherKeys, dev_thrustGatherKeys + numObjects, dev_thrust_vel1, dev_thrustGatherVelDest);
+#endif
+#if MANUAL_GATHER
+    kernShuffle<<<blocks, threadsPerBlock>>>(numObjects, dev_particleArrayIndices, dev_pos2, dev_pos, dev_vel2, dev_vel1);
+#endif
 
     temp = dev_pos;
     dev_pos = dev_pos2;
@@ -708,10 +867,18 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     kernIdentifyCellStartEnd << <blocks, blockSize >> > (numObjects, dev_particleGridIndices,
         dev_gridCellStartIndices, dev_gridCellEndIndices);
 
+#if GRID_LOOPING_OPT
+    kernUpdateVelNeighborSearchCoherentGridLoopOptimization << <blocks, threadsPerBlock >> > (numObjects, gridSideCount, gridMinimum,
+        gridInverseCellWidth, gridCellWidth,
+        dev_gridCellStartIndices, dev_gridCellEndIndices,
+        dev_pos, dev_vel1, dev_vel2);
+#endif
+#if !GRID_LOOPING_OPT
     kernUpdateVelNeighborSearchCoherent << <blocks, threadsPerBlock >> > (numObjects, gridSideCount, gridMinimum,
         gridInverseCellWidth, gridCellWidth,
         dev_gridCellStartIndices, dev_gridCellEndIndices,
         dev_pos, dev_vel1, dev_vel2);
+#endif
 
     kernUpdatePos << <blocks, threadsPerBlock >> > (numObjects, dt, dev_pos, dev_vel2);
 
