@@ -15,7 +15,7 @@
 #include <thrust/device_vector.h>
 
 // For use of zip iterator
-#define ZIP_ITERATOR 1
+#define ZIP_ITERATOR 0
 #if ZIP_ITERATOR
 #include <thrust/tuple.h>
 #include <thrust/iterator/zip_iterator.h>
@@ -194,7 +194,8 @@ void Boids::initSimulation(int N) {
   checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
 
   // LOOK-2.1 computing grid params
-  gridCellWidth = 2.0f * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
+  float gridCellFac = 1.f;
+  gridCellWidth = gridCellFac * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
   int halfSideCount = (int)(scene_scale / gridCellWidth) + 1;
   gridSideCount = 2 * halfSideCount;
 
@@ -418,6 +419,8 @@ __global__ void kernIdentifyCellStartEnd(int N, int *particleGridIndices,
     if (idx >= N) return;
 
     int selfGridIndex = particleGridIndices[idx];
+    if (idx == 0) gridCellStartIndices[selfGridIndex] = 0;
+
     if (idx == N - 1) {
         gridCellEndIndices[selfGridIndex] = idx;
     }
