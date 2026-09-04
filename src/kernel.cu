@@ -64,6 +64,7 @@ void checkCUDAError(const char *msg, int line = -1) {
 
 /*! Block size used for CUDA kernel launch. */
 #define blockSize 128
+#define gridCellFac 2.f
 
 // LOOK-1.2 Parameters for the boids algorithm.
 // These worked well in our reference implementation.
@@ -194,7 +195,6 @@ void Boids::initSimulation(int N) {
   checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
 
   // LOOK-2.1 computing grid params
-  float gridCellFac = 1.f;
   gridCellWidth = gridCellFac * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
   int halfSideCount = (int)(scene_scale / gridCellWidth) + 1;
   gridSideCount = 2 * halfSideCount;
@@ -640,8 +640,10 @@ __global__ void kernUpdateVelNeighborSearchCoherentGridLoopOptimization(
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
 
     glm::vec3 posSelf;
+    glm::vec3 velSelf;
     if (idx < N) {
         posSelf = pos[idx];
+        velSelf = vel1[idx];
     }
 
 #if SHARED_MEMORY_OPT
@@ -650,7 +652,7 @@ __global__ void kernUpdateVelNeighborSearchCoherentGridLoopOptimization(
 
     if (idx < N) {
         sPos[threadIdx.x] = posSelf;
-        sVel1[threadIdx.x] = vel1[idx];
+        sVel1[threadIdx.x] = velSelf;
     }
     __syncthreads();
 #endif
@@ -676,26 +678,40 @@ __global__ void kernUpdateVelNeighborSearchCoherentGridLoopOptimization(
         for (int j = lo.y; j <= hi.y; ++j) {
             for (int i = lo.x; i <= hi.x; ++i) {
                 //Check if this cell is reachable
-                glm::vec3 cellMin = cellWidth * glm::vec3(i, j, k) + gridMin;
-                glm::vec3 cellMax = cellWidth * glm::vec3(i + 1, j + 1, k + 1) + gridMin;
-                glm::vec3 closest = glm::clamp(posSelf, cellMin, cellMax);
-                if (glm::length(closest - posSelf) > maxRuleDistance) continue;
+                {
+                    glm::vec3 cellMin = cellWidth * glm::vec3(i, j, k) + gridMin;
+                    glm::vec3 cellMax = cellWidth * glm::vec3(i + 1, j + 1, k + 1) + gridMin;
+                    glm::vec3 closest = glm::clamp(posSelf, cellMin, cellMax);
+                    if (glm::length(closest - posSelf) > maxRuleDistance) continue;
+                }
 
                 //Loop over vertices in this grid cell
                 for (int pIdx = gridCellStartIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; pIdx <= gridCellEndIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; ++pIdx) {
                     if (pIdx == -1) break;
 
-                    if (pIdx != idx) {
+                    if (pIdx == idx) continue;
+
+                    {
+                        glm::vec3 pPos;
+                        glm::vec3 pVel;
 #if SHARED_MEMORY_OPT
                         //Check if it's in the shared memory cache (the thread responsible for this other boid is in this block)
-                        glm::vec3 pPos = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
-                            sPos[pIdx - blockIdx.x * blockDim.x] : pos[pIdx];
-                        glm::vec3 pVel = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
-                            sVel1[pIdx - blockIdx.x * blockDim.x] : vel1[pIdx];
+                        
+                        {
+                            if (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) {
+                                pPos = sPos[pIdx - blockIdx.x * blockDim.x];
+                                pVel = sVel1[pIdx - blockIdx.x * blockDim.x];
+                            }
+                            else {
+                                pPos = pos[pIdx];
+                                pVel = vel1[pIdx];
+                            }
+                        }
+
 #endif
 #if !SHARED_MEMORY_OPT
-                        glm::vec3 pPos = pos[pIdx];
-                        glm::vec3 pVel = vel1[pIdx];
+                        pPos = pos[pIdx];
+                        pVel = vel1[pIdx];
 #endif
 
                         float dist = glm::length(pPos - posSelf);
@@ -730,10 +746,132 @@ __global__ void kernUpdateVelNeighborSearchCoherentGridLoopOptimization(
     r2Dir *= rule2Scale;
     r3Vel *= rule3Scale / numNeighbors3;
 
-    glm::vec3 newVel = vel1[idx] + r1PerceivedCenter + r2Dir + r3Vel;
+    glm::vec3 newVel = velSelf + r1PerceivedCenter + r2Dir + r3Vel;
     newVel = (glm::length(newVel) > maxSpeed) ? glm::normalize(newVel) * maxSpeed : newVel;
     vel2[idx] = newVel;
 }
+
+//__global__ void kernUpdateVelNeighborSearchCoherentSharedMemory2(
+//    int N, int gridResolution, glm::vec3 gridMin,
+//    float inverseCellWidth, float cellWidth,
+//    int *gridCellStartIndices, int *gridCellEndIndices,
+//    glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 *vel2) {
+//    // TODO-2.3 - This should be very similar to kernUpdateVelNeighborSearchScattered,
+//    // except with one less level of indirection.
+//    // This should expect gridCellStartIndices and gridCellEndIndices to refer
+//    // directly to pos and vel1.
+//    // - Identify the grid cell that this particle is in
+//    // - Identify which cells may contain neighbors. This isn't always 8.
+//    // - For each cell, read the start/end indices in the boid pointer array.
+//    //   DIFFERENCE: For best results, consider what order the cells should be
+//    //   checked in to maximize the memory benefits of reordering the boids data.
+//    // - Access each boid in the cell and compute velocity change from
+//    //   the boids rules, if this boid is within the neighborhood distance.
+//    // - Clamp the speed change before putting the new speed in vel2
+//
+//    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+//    
+//    //All the cells that contain boids corresponding to the threads in this block
+//    glm::ivec3 startCell = glm::floor((pos[blockIdx.x * blockDim.x] - gridMin) * inverseCellWidth);
+//    glm::ivec3 endCell = glm::floor((pos[(blockIdx.x + 1) * blockDim.x - 1] - gridMin) * inverseCellWidth);
+//
+//    float maxRuleDistance = glm::max(rule1Distance, glm::max(rule2Distance, rule3Distance));
+//
+//    //All the cells that could contain boids that could influence the boids corresponding to the treads in this block
+//    glm::ivec3 iStartCell = glm::max(startCell - int(inverseCellWidth * maxRuleDistance));
+//    int startIndex
+//
+//    glm::vec3 posSelf;
+//    glm::vec3 velSelf;
+//    if (idx < N) {
+//        posSelf = pos[idx];
+//        velSelf = vel1[idx];
+//    }
+//
+//    __shared__ glm::vec3 sPos[blockSize];
+//    __shared__ glm::vec3 sVel1[blockSize];
+//
+//    if (idx < N) {
+//        sPos[threadIdx.x] = posSelf;
+//        sVel1[threadIdx.x] = vel1[idx];
+//    }
+//    __syncthreads();
+//
+//    if (idx >= N) return;
+//
+//    
+//
+//    glm::vec3 gridCell = (pos[idx] - gridMin) * inverseCellWidth;
+//
+//    //Compute the bounds of the bounding box containing all possible reachable grid cells
+//    glm::ivec3 lo = glm::floor(glm::max(glm::vec3(0), gridCell - maxRuleDistance / cellWidth));
+//    glm::ivec3 hi = glm::floor(glm::min(glm::vec3(gridResolution - 1), gridCell + maxRuleDistance / cellWidth));
+//
+//    float numNeighbors1{ 0.f };
+//    float numNeighbors3{ 0.f };
+//
+//    glm::vec3 r1PerceivedCenter{ 0.f };
+//    glm::vec3 r2Dir{ 0.f };
+//    glm::vec3 r3Vel{ 0.f };
+//
+//    for (int k = lo.z; k <= hi.z; ++k) {
+//        for (int j = lo.y; j <= hi.y; ++j) {
+//            for (int i = lo.x; i <= hi.x; ++i) {
+//                //Check if this cell is reachable
+//                glm::vec3 cellMin = cellWidth * glm::vec3(i, j, k) + gridMin;
+//                glm::vec3 cellMax = cellWidth * glm::vec3(i + 1, j + 1, k + 1) + gridMin;
+//                glm::vec3 closest = glm::clamp(posSelf, cellMin, cellMax);
+//                if (glm::length(closest - posSelf) > maxRuleDistance) continue;
+//
+//                //Loop over vertices in this grid cell
+//                for (int pIdx = gridCellStartIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; pIdx <= gridCellEndIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; ++pIdx) {
+//                    if (pIdx == -1) break;
+//
+//                    if (pIdx != idx) {
+//                        //Check if it's in the shared memory cache (the thread responsible for this other boid is in this block)
+//                        /*glm::vec3 pPos = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+//                            sPos[pIdx - blockIdx.x * blockDim.x] : pos[pIdx];
+//                        glm::vec3 pVel = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+//                            sVel1[pIdx - blockIdx.x * blockDim.x] : vel1[pIdx];*/
+//                        glm::vec3 pPos = pos[pIdx];
+//                        glm::vec3 pVel = vel1[pIdx];
+//
+//                        float dist = glm::length(pPos - posSelf);
+//
+//                        //Rule1
+//                        if (dist < rule1Distance) {
+//                            r1PerceivedCenter += pPos;
+//                            ++numNeighbors1;
+//                        }
+//
+//                        //Rule2
+//                        if (dist < rule2Distance) {
+//                            r2Dir -= pPos - posSelf;
+//                        }
+//
+//                        //Rule3
+//                        if (dist < rule3Distance) {
+//                            r3Vel += pVel;
+//                            ++numNeighbors3;
+//                        }
+//                    }
+//                }
+//            }
+//        }
+//    }
+//
+//    //Prevent shenanigans if 0 neighbors
+//    numNeighbors1 = (numNeighbors1) ? numNeighbors1 : 1.f;
+//    numNeighbors3 = (numNeighbors3) ? numNeighbors3 : 1.f;
+//
+//    r1PerceivedCenter = (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale;
+//    r2Dir *= rule2Scale;
+//    r3Vel *= rule3Scale / numNeighbors3;
+//
+//    glm::vec3 newVel = velSelf + r1PerceivedCenter + r2Dir + r3Vel;
+//    newVel = (glm::length(newVel) > maxSpeed) ? glm::normalize(newVel) * maxSpeed : newVel;
+//    vel2[idx] = newVel;
+//}
 
 /**
 * Step the entire N-body simulation by `dt` seconds.

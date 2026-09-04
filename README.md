@@ -94,7 +94,7 @@ Let's take a look at the numbers now. As a fun exercise, take a guess of how you
 Fps benchmarks were done by taking the average fps over a window of `seconds = 20` on my laptop's maximum performance setting. I noticed that there tended to be a spike at the beginning of execution, so I included a `warmup = 2`.
 
 ### Comparing the four methods outlined earlier
-Here's an fps performance comparison between the four methods I outlined earlier. Note that the cell width was set to `2 * maxRuleDistance`. We'll check out the effects of varying the cell width later.
+Here's an fps performance comparison between the four methods I outlined earlier. Note that the cell width was set to `2 * maxRuleDistance`, and the block size was set to 128. We'll check out the effects of varying the cell width later.
 
 ![Benchmarks comparing naive, scattered, coherent w/ zip-iterator, and coherent w/ gather-style](images/Benchmarks1.png)
 
@@ -114,7 +114,30 @@ It works by using the cell width and the maximum rule distance to compute a boun
 ### Using shared memory
 Another potential bottleneck is the large amount of reads we're doing from global memory. Some of that is probably cached since adjacent threads are more likely to also be adjacent in space, but we can try optimizing this a bit by putting as many boids as we can into shared memory.
 
-### Caching with shared memory
+Here's my shared memory caches:
+```
+    __shared__ glm::vec3 sPos[blockSize];
+    __shared__ glm::vec3 sVel1[blockSize];
+
+    ...
+
+    if (idx < N) {
+        sPos[threadIdx.x] = posSelf;
+        sVel1[threadIdx.x] = vel1[idx];
+    }
+```
+
+Then while iterating over the neighboring boids, I check if the thread responsible for the other boid is in the block with the following code, where `pIdx` is the index of the other boid (and its thread):
+```
+    glm::vec3 pPos = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+        sPos[pIdx - blockIdx.x * blockDim.x] : 
+        pos[pIdx];
+    
+    glm::vec3 pVel = (pIdx >= blockIdx.x * blockDim.x && pIdx < (blockIdx.x + 1) * blockDim.x) ?
+        sVel1[pIdx - blockIdx.x * blockDim.x] : 
+        vel1[pIdx];
+```
+Is it the best way of going about using shared memory? Probably not. I am hoping that the neighboring threads' boids are close by, which may not be a good assumption when the boid **TODO**
 
 Include screenshots, analysis, etc. (Remember, this is public, so don't put
 anything here that you don't want to share with the world.)
