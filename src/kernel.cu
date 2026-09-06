@@ -319,10 +319,9 @@ __device__ glm::vec3 computeVelocityChange(int N, int iSelf, const glm::vec3 *po
     }
 
     //Prevent shenanigans if 0 neighbors
-    numNeighbors1 = (numNeighbors1) ? numNeighbors1 : 1.f;
     numNeighbors3 = (numNeighbors3) ? numNeighbors3 : 1.f;
 
-    r1PerceivedCenter = (r1PerceivedCenter / numNeighbors1 - pos[iSelf]) * rule1Scale;
+    r1PerceivedCenter = numNeighbors1 ? (r1PerceivedCenter / numNeighbors1 - pos[iSelf]) * rule1Scale : glm::vec3(0);
     r2Dir *= rule2Scale;
     r3Vel *= rule3Scale / numNeighbors3;
 
@@ -500,10 +499,9 @@ __global__ void kernUpdateVelNeighborSearchScattered(
     }
 
     //Prevent shenanigans if 0 neighbors
-    numNeighbors1 = (numNeighbors1) ? numNeighbors1 : 1.f;
     numNeighbors3 = (numNeighbors3) ? numNeighbors3 : 1.f;
 
-    r1PerceivedCenter = (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale;
+    r1PerceivedCenter = numNeighbors1 ? (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale : glm::vec3(0);
     r2Dir *= rule2Scale;
     r3Vel *= rule3Scale / numNeighbors3;
 
@@ -606,10 +604,9 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
     }
 
     //Prevent shenanigans if 0 neighbors
-    numNeighbors1 = (numNeighbors1) ? numNeighbors1 : 1.f;
     numNeighbors3 = (numNeighbors3) ? numNeighbors3 : 1.f;
 
-    r1PerceivedCenter = (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale;
+    r1PerceivedCenter = numNeighbors1 ? (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale : glm::vec3(0);
     r2Dir *= rule2Scale;
     r3Vel *= rule3Scale / numNeighbors3;
 
@@ -739,15 +736,14 @@ __global__ void kernUpdateVelNeighborSearchCoherentGridLoopOptimization(
     }
 
     //Prevent shenanigans if 0 neighbors
-    numNeighbors1 = (numNeighbors1) ? numNeighbors1 : 1.f;
     numNeighbors3 = (numNeighbors3) ? numNeighbors3 : 1.f;
 
-    r1PerceivedCenter = (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale;
+    r1PerceivedCenter = numNeighbors1 ? (r1PerceivedCenter / numNeighbors1 - posSelf) * rule1Scale : glm::vec3(0);
     r2Dir *= rule2Scale;
     r3Vel *= rule3Scale / numNeighbors3;
 
     glm::vec3 newVel = velSelf + r1PerceivedCenter + r2Dir + r3Vel;
-    newVel = (glm::length(newVel) > maxSpeed) ? glm::normalize(newVel) * maxSpeed : newVel;
+    newVel *= (glm::length(newVel) > maxSpeed) ? maxSpeed / glm::length(newVel) : 1;
     vel2[idx] = newVel;
 }
 
