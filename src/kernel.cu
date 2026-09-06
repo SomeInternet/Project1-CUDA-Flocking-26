@@ -63,7 +63,7 @@ void checkCUDAError(const char *msg, int line = -1) {
 *****************/
 
 /*! Block size used for CUDA kernel launch. */
-#define blockSize 128
+#define blockSize 256
 #define gridCellFac 2.f
 
 // LOOK-1.2 Parameters for the boids algorithm.
@@ -462,9 +462,9 @@ __global__ void kernUpdateVelNeighborSearchScattered(
     glm::vec3 r2Dir{ 0.f };
     glm::vec3 r3Vel{ 0.f };
 
-    for (int i = glm::max(lo.x, 0); i <= glm::min(hi.x, gridResolution - 1); ++i) {
+    for (int k = glm::max(lo.z, 0); k <= glm::min(hi.z, gridResolution - 1); ++k) {
         for (int j = glm::max(lo.y, 0); j <= glm::min(hi.y, gridResolution - 1); ++j) {
-            for (int k = glm::max(lo.z, 0); k <= glm::min(hi.z, gridResolution - 1); ++k) {
+            for (int i = glm::max(lo.x, 0); i <= glm::min(hi.x, gridResolution - 1); ++i) {
 
                 //Loop over vertices in this grid cell
                 for (int l = gridCellStartIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; l <= gridCellEndIndices[gridIndex3Dto1D(i, j, k, gridResolution)]; ++l) {
@@ -1103,4 +1103,60 @@ void Boids::unitTest() {
   cudaFree(dev_intValues);
   checkCUDAErrorWithLine("cudaFree failed!");
   return;
+}
+
+static void reportKernelOccupancy(const char *name, const void *func,
+    const cudaDeviceProp &props) {
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, func);
+
+    printf("\n  %s\n", name);
+    printf("    registers/thread: %d   shared/block: %zu B   local/thread: %zu B\n",
+        attr.numRegs, attr.sharedSizeBytes, attr.localSizeBytes);
+    printf("    max threads/block for this kernel: %d\n", attr.maxThreadsPerBlock);
+    printf("    %-6s %-8s %-8s %-10s %s\n",
+        "block", "blk/SM", "thr/SM", "occupancy", "binding limit");
+
+    const int blockSizes[] = { 32, 64, 128, 256, 512, 1024 };
+    for (int i = 0; i < 6; i++) {
+        int bs = blockSizes[i];
+        int activeBlocks = 0;
+        cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &activeBlocks, func, bs, 0);
+
+        if (err != cudaSuccess || activeBlocks == 0) {
+            printf("    %-6d  (cannot launch at this block size)\n", bs);
+            cudaGetLastError();  // clear the sticky error
+            continue;
+        }
+
+        int threadsPerSM = activeBlocks * bs;
+        float occupancy = (float)threadsPerSM / (float)props.maxThreadsPerMultiProcessor;
+
+        // Which resource runs out first? (register estimate ignores allocation
+        // granularity, so treat it as approximate.)
+        int threadCapBlocks = props.maxThreadsPerMultiProcessor / bs;
+        int blockCapBlocks = props.maxBlocksPerMultiProcessor;
+        int regCapBlocks = attr.numRegs > 0
+            ? props.regsPerMultiprocessor / (attr.numRegs * bs)
+            : INT_MAX;
+        int smemCapBlocks = attr.sharedSizeBytes > 0
+            ? (int)(props.sharedMemPerMultiprocessor / attr.sharedSizeBytes)
+            : INT_MAX;
+
+        const char *limit = "threads/SM";
+        int lowest = threadCapBlocks;
+        if (blockCapBlocks < lowest) { lowest = blockCapBlocks; limit = "blocks/SM"; }
+        if (regCapBlocks < lowest) { lowest = regCapBlocks;   limit = "registers (approx)"; }
+        if (smemCapBlocks < lowest) { lowest = smemCapBlocks;  limit = "shared mem"; }
+
+        printf("    %-6d %-8d %-8d %-10.0f%% %s\n",
+            bs, activeBlocks, threadsPerSM, occupancy * 100.0f, limit);
+    }
+
+    int minGridSize = 0, suggestedBlockSize = 0;
+    if (cudaOccupancyMaxPotentialBlockSize(&minGridSize, &suggestedBlockSize,
+        func, 0, 0) == cudaSuccess) {
+        printf("    CUDA's suggested block size: %d\n", suggestedBlockSize);
+    }
 }
