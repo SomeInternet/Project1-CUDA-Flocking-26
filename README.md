@@ -3,7 +3,7 @@ Project 1 - Flocking**
 
 * T Fong
   * [LinkedIn](https://www.linkedin.com/in/tzfong/), [personal website](https://www.tzfong.com/)
-* Tested on: Windows 11, Intel Ultra9 275HX (2.70 GHz), RTX 5070 Mobile, 32 GB RAM (2800 MHz)
+* Tested on: Windows 11, Intel Ultra9 275HX (2.70 GHz), RTX 5070 Mobile, 32 GB RAM (5600 MT/s)
 
 ![GIF of the boids](images/boids.gif)
 
@@ -193,3 +193,10 @@ Yeah, unfortunately, at every configuration I tested (including some not listed 
 
 ![NSight Compute profile (with shared memory usage)](images/Profiling4.png)
 ![NSight Compute profile (without shared memory usage)](images/Profiling3.png)
+
+### Blooper (singular)
+I would put more bloopers here, but I kind of only have the one funny looking one. I was implementing one of the optimizations and noticed my FPS tanked as a result. I turned on visualization to see that would give me an idea of what was going on and was greeted by **the cube**.
+
+![the cube](images/blooper.png)
+
+Dunno what the cause was, but since the boids are much more densely packed together (especially at the edges of **the cube**), you'd see why performance would degrade, as each boid would be iterating over way more boids.
